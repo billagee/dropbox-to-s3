@@ -7,6 +7,16 @@
 #s3cmd ls s3://$BUCKET_NAME/photos/2015/11/iPhone5/
 #s3cmd ls s3://$BUCKET_NAME/photos/2015/11/iPhone5/video/
 
+# TODO!!!
+# Instead of a plain mv of files from ~/Dropbox to the staging dir, do this:
+# * checksum the source dir (w/ md5? what's fastest?)
+# * cp the files to the dest dir
+# * checksum the dest dir
+# * check that the src and dst checksums are identical (or just diff -r?)
+# * bail out if they differ; otherwise display a y/n prompt offering to
+#   delete the original ~/Dropbox files (at the end, after they're in s3)
+# * ALSO: Can we add an s3 checksum to be extra-safe? Like dx-verify-file?
+
 function box_out()
 {
   local s=("$@") b w
@@ -23,6 +33,9 @@ function box_out()
  -${b//?/-}-"
   tput sgr 0
 }
+
+# TODO  - use getopts to set options and a help message,
+# as per membrane/run_tests_in_container.sh
 
 # Define local dir for current month's photos and videos
 echo -n "Enter your s3 bucket name and press [ENTER]: "
