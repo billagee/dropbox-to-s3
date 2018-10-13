@@ -9,6 +9,7 @@ import glob
 import itertools
 import os
 import pandas as pd
+import pathlib
 import sqlite3
 import sys
 from os.path import expanduser
@@ -28,8 +29,7 @@ dir against the original local working dir
 class BackupContext(object):
     def __init__(self, bucket_name, year, month, device):
         self.db = sqlite3.connect(':memory:')
-        self.cur = self.db.cursor()
-        self.init_db(self.cur)
+        self.dbcursor = self.db.cursor()
         self.s3 = boto3.resource('s3')
         self.bucket = self.s3.Bucket(bucket_name)
         self.homedir = expanduser("~")
@@ -37,95 +37,69 @@ class BackupContext(object):
         self.year = year
         self.month = month
         self.device = device
-        self.dropbox_camera_uploads_dir = "{0}/Dropbox/Camera Uploads/".format(self.homedir)
         self.dir_prefix = "photos/{year}/{month}/{device}".format(
             year=self.year,
             month=self.month,
             device=self.device)
+        self.dropbox_camera_uploads_dir = pathlib.Path(
+            "{0}/Dropbox/Camera Uploads/".format(self.homedir))
         # e.g., ~/Pictures/s3/mybucket/photos/2016/08/iPhone6s/
-        self.local_working_dir = "{homedir}/Pictures/s3/{bucket}/{dir_prefix}/".format(
-            homedir=self.homedir,
-            bucket=self.bucket_name,
-            dir_prefix=self.dir_prefix)
+        self.local_working_dir = pathlib.Path(
+            "{homedir}/Pictures/s3/{bucket}/{dir_prefix}/".format(
+                homedir=self.homedir,
+                bucket=self.bucket_name,
+                dir_prefix=self.dir_prefix))
         # The file extensions that we'll operate on
         self.supported_file_extensions = ["jpg", "mov"]
         self.video_file_extensions = [".mov"]
-        # Walk ~/Dropbox/Camera Uploads and find all files matching
-        # the year/month given.
+
+        # Walk Dropbox and working dir paths and find all files matching
+        # the given year/month.
         self.dropbox_file_paths = []
-        for file_extension in self.supported_file_extensions:
-            glob_pattern = self.make_glob_pattern(
-                self.dropbox_camera_uploads_dir, file_extension)
-            self.dropbox_file_paths.extend(sorted(glob.glob(glob_pattern, recursive=True)))
-        # Do the same for working dir
         self.working_dir_file_paths = []
-        for file_extension in self.supported_file_extensions:
-            glob_pattern = self.make_glob_pattern(
-                self.local_working_dir, file_extension)
-            self.working_dir_file_paths.extend(sorted(glob.glob(glob_pattern, recursive=True)))
+        for file_ext in self.supported_file_extensions:
+            pattern = "**/{}-{}-*.{}".format(self.year, self.month, file_ext)
+            self.dropbox_file_paths.extend(
+                sorted(self.dropbox_camera_uploads_dir.glob(pattern)))
+            self.working_dir_file_paths.extend(
+                sorted(self.local_working_dir.glob(pattern)))
+        self.dropbox_filenames = [x.name for x in self.dropbox_file_paths]
+        self.working_dir_filenames = [x.name for x in self.working_dir_file_paths]
+
         # Get bucket contents for year/month/device
         self.bucket_file_paths = [
             obj.key
             for obj
             in self.bucket.objects.filter(Prefix=self.dir_prefix)]
-        # Find filenames that exist in both dropbox and workdir
-        self.dropbox_filenames = [
-            x.split("/")[-1] for x in self.dropbox_file_paths]
-        self.working_dir_filenames = [
-            x.split("/")[-1] for x in self.working_dir_file_paths]
         self.bucket_filenames = [
             x.split("/")[-1] for x in self.bucket_file_paths]
         # Populate DB
-        # Files in dropbox and workdir and s3
-        files_in_intersection = set(self.dropbox_filenames).intersection(
-            self.working_dir_filenames, self.bucket_filenames)
-        for filename in files_in_intersection:
-            self.db_insert(filename, in_dropbox=True, in_workdir=True, in_s3=True)
-        # Files only in dropbox
-        #for filename in set(self.dropbox_filenames) - set(self.working_dir_filenames) - set(self.bucket_filenames):
-        for filename in set(self.dropbox_filenames) - set(self.working_dir_filenames) - set(self.bucket_filenames):
-            self.db_insert(filename, in_dropbox=True, in_workdir=False, in_s3=False)
-        # Files only in workdir
-        for filename in set(self.working_dir_filenames) - set(self.dropbox_filenames) - set(self.bucket_filenames):
-            self.db_insert(filename, in_dropbox=False, in_workdir=True, in_s3=False)
-        # Files only in bucket
-        for filename in set(self.bucket_filenames) - set(self.working_dir_filenames) - set(self.dropbox_filenames):
-            self.db_insert(filename, in_s3=True, in_workdir=False, in_dropbox=False)
-        # Files in bucket and workdir but not dropbox
-        for filename in set(self.working_dir_filenames) & set(self.bucket_filenames):
-            self.db_insert(filename, in_s3=True, in_workdir=True)
-        # Files in dropbox and workdir but not bucket
-        for filename in set(self.dropbox_filenames) & set(self.working_dir_filenames):
-            self.db_insert(filename, in_s3=True, in_workdir=True)
-        # Populate data on working dir files
-        #for working_dir_filename in self.working_dir_filenames:
-            #if dropbox_filename in self.working_dir_filenames:
-            #    self.cur.execute('''
-            #        UPDATE files SET InWorkingDir = 1 WHERE Filename = ?''', (dropbox_filename,))
+        self.init_db()
 
-    def db_insert(self, filename, in_dropbox=False, in_workdir=False, in_s3=False):
-        self.cur.execute('''
-            INSERT INTO files (Filename, InDropbox, InWorkingDir, InS3, Year, Month, Device)
-            VALUES (?, ?, ?, ?, ?, ?, ?)''', (filename, in_dropbox, in_workdir, in_s3, self.year, self.month, self.device))
+    def init_db(self):
+        self.dbcursor.execute('''CREATE TABLE files (
+            Filename TEXT PRIMARY KEY,
+            InDropbox INTEGER DEFAULT 0,
+            InWorkingDir INTEGER DEFAULT 0,
+            InS3 INTEGER DEFAULT 0)''')
+        for file_name in self.dropbox_filenames:
+            self.do_upsert_true_value_for_column(
+                file_name=file_name, column="InDropbox")
+        for file_name in self.working_dir_filenames:
+            self.do_upsert_true_value_for_column(
+                file_name=file_name, column="InWorkingDir")
+        for file_name in self.bucket_filenames:
+            self.do_upsert_true_value_for_column(
+                file_name=file_name, column="InS3")
+
+    def do_upsert_true_value_for_column(self, file_name, column):
+        self.dbcursor.execute("""
+            INSERT INTO files (Filename, {column})
+            VALUES ('{file_name}', 1)
+            ON CONFLICT (Filename)
+            DO UPDATE SET {column} = 1 WHERE Filename = '{file_name}'""".format(
+                file_name=file_name, column=column))
         self.db.commit()
-
-
-    def init_db(self, cur):
-        cur.execute('''CREATE TABLE files (
-            Filename TEXT,
-            InDropbox BOOLEAN,
-            InWorkingDir BOOLEAN,
-            InS3 BOOLEAN,
-            Year TEXT,
-            Month TEXT,
-            Device TEXT)''')
-
-    def make_glob_pattern(self, root_dir, file_extension):
-        return "{0}/**/{1}-{2}*.{3}".format(
-            root_dir,
-            self.year,
-            self.month,
-            file_extension)
 
     def __repr__(self):
         return '<BackupContext %r>' % self.local_working_dir
@@ -146,6 +120,12 @@ def cli(ctx, bucket_name, year, month, device):
     """
     This utility copies image/video files from ~/Dropbox/Camera Uploads/
     into a local working dir, then syncs the working dir to an s3 bucket.
+
+    Example workflow:\n
+      dropbox2s3 mkdir\n
+      dropbox2s3 cp\n
+      dropbox2s3 sync\n
+      dropbox2s3 rm-dropbox-files
     """
     # Create a BackupContext object and remember it as as the context object.
     # From this point onwards other commands can refer to it by using the
@@ -360,9 +340,29 @@ def lsbucket(backup_context):
 def lsdb(backup_context):
     """Populate and print db contents for given year/month/device.
     """
-    #backup_context.cur.execute('''
+    #backup_context.dbcursor.execute('''
     #    SELECT * FROM files''')
     #from pprint import pprint
-    #pprint(backup_context.cur.fetchall())
+    #pprint(backup_context.dbcursor.fetchall())
     pd.set_option('display.max_rows', 500)
     print(pd.read_sql_query("SELECT * FROM files", backup_context.db))
+
+@cli.command()
+@pass_backup_context
+def lsdropbox(backup_context):
+    """Print Dropbox contents for given year/month/device.
+    """
+    for path in backup_context.dropbox_file_paths:
+        print(path)
+    for filename in backup_context.dropbox_filenames:
+        print(filename)
+
+@cli.command()
+@pass_backup_context
+def lsworkdir(backup_context):
+    """Print working dir contents for given year/month/device.
+    """
+    for path in backup_context.working_dir_file_paths:
+        print(path)
+    for filename in backup_context.working_dir_filenames:
+        print(filename)
