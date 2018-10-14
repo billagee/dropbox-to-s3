@@ -247,6 +247,7 @@ def difflocal(backup_context):
             workdir_file_abspath = backup_context.local_working_dir / "video" / filename
         else:
             workdir_file_abspath = backup_context.local_working_dir / filename
+
         if (in_dropbox == 1 and in_workdir == 0):
             print(fmt.format(filename, "dropbox only"))
         elif (in_dropbox == 0 and in_workdir == 1): 
@@ -269,21 +270,26 @@ def diffbucket(backup_context):
     query = 'SELECT * FROM files ORDER BY Filename'
     for row in backup_context.dbcursor.execute(query):
         filename = row["Filename"]
+        in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
         in_s3 = row["InS3"]
+        """
         workdir_file_abspath = backup_context.local_working_dir / filename
         file_ext = pathlib.Path(filename).suffix
         if file_ext in (backup_context.video_file_extensions):
             workdir_file_abspath = backup_context.local_working_dir / "video" / filename
         else:
             workdir_file_abspath = backup_context.local_working_dir / filename
-        if (in_workdir == 1 and in_s3 == 0):
+        """
+        if (in_workdir == 1 and in_s3 == 1):
+            print(fmt.format(filename, "👍"))
+            # TODO - compare s3 etag checksum for file against md5 of local file
+        elif (in_workdir == 1 and in_s3 == 0):
             print(fmt.format(filename, "workdir only"))
         elif (in_workdir == 0 and in_s3 == 1): 
             print(fmt.format(filename, "s3 only"))
-        else:
-            print(fmt.format(filename, "👍"))
-            # TODO - compare s3 etag checksum for file against md5 of local file
+        elif (in_dropbox == 1): 
+            print(fmt.format(filename, "dropbox only"))
 
 @cli.command()
 @pass_backup_context
