@@ -48,7 +48,7 @@ class BackupContext(object):
                 bucket=self.bucket_name,
                 dir_prefix=self.dir_prefix))
         # The file extensions that we'll operate on
-        self.supported_file_extensions = ["jpg", "mov"]
+        self.supported_file_extensions = ["jpg", "png", "mov"]
         self.video_file_extensions = [".mov"]
 
         # Walk Dropbox and working dir paths and find all files matching
@@ -56,7 +56,7 @@ class BackupContext(object):
         self.dropbox_filenames = []
         self.working_dir_filenames = []
         for file_ext in self.supported_file_extensions:
-            pattern = "**/{}-{}-*.{}".format(self.year, self.month, file_ext)
+            pattern = self.get_glob_pattern(file_ext)
             dropbox_glob = self.dropbox_camera_uploads_dir.glob(pattern)
             self.dropbox_filenames.extend( [ x.name for x in sorted(dropbox_glob) ] )
             workdir_glob = self.local_working_dir.glob(pattern)
@@ -70,6 +70,13 @@ class BackupContext(object):
             x.split("/")[-1] for x in self.bucket_file_paths]
         # Populate DB
         self.init_db()
+
+    def get_glob_pattern(self, file_ext):
+        if self.device == "NikonCoolpix":
+            pattern = "**/*DSCN*.{}".format(file_ext.upper())
+        else:
+            pattern = "**/{}-{}-*.{}".format(self.year, self.month, file_ext)
+        return pattern
 
     def init_db(self):
         # TODO - add an IsVideo column so we don't have to check for .mov extension
@@ -101,6 +108,17 @@ class BackupContext(object):
         query = "SELECT * FROM files WHERE Filename = ?"
         row = self.dbcursor.execute(query, (file_name,)).fetchone()
         return row
+
+    def mkdir(self):
+        if not os.path.exists(self.local_working_dir):
+            click.echo("About to create working dir at {}".format(
+                self.local_working_dir))
+            click.confirm("Do you want to continue?", abort=True)
+            # Append /video to working dir path since videos are stored separately
+            os.makedirs(self.local_working_dir / "video")
+        else:
+            click.echo("Working dir already exists at {}".format(
+                self.local_working_dir))
 
     def __repr__(self):
         return '<BackupContext %r>' % self.local_working_dir
@@ -144,14 +162,7 @@ def mkdir(backup_context):
     will be copied from your Dropbox/Camera Uploads/ dir.
     The working dir files can then be uploaded to an s3 bucket.
     """
-    if not os.path.exists(backup_context.local_working_dir):
-        click.echo("About to create working dir at {}".format(backup_context.local_working_dir))
-        click.confirm("Do you want to continue?", abort=True)
-        # Append /video to working dir path since videos are stored separately
-        os.makedirs(backup_context.local_working_dir + "/video")
-    else:
-        click.echo("Doing nothing; working dir already exists at {}".format(
-            backup_context.local_working_dir))
+    backup_context.mkdir()
 
 @cli.command()
 @pass_backup_context
@@ -163,6 +174,8 @@ def cp(backup_context, dryrun):
     Note that files with video extensions will be copied into
     a "video" subdir of the working dir.
     """
+    # Check for working dir and run mkdir() if it doesn't exist
+    backup_context.mkdir()
     click.echo("About to copy files from: {}".format(
         backup_context.dropbox_camera_uploads_dir))
     click.echo("To local working dir: {}".format(
@@ -176,7 +189,8 @@ def cp(backup_context, dryrun):
             click.echo("Skipping file '{}'; it already exists in workdir".format(dropbox_file_name))
             continue
         # Set destination dir
-        if os.path.splitext(dropbox_file_name) in backup_context.video_file_extensions:
+        file_ext = os.path.splitext(dropbox_file_name)[1]
+        if file_ext in backup_context.video_file_extensions:
             dest_root = dest_videos
         else:
             dest_root = dest_images
@@ -202,7 +216,7 @@ def rm_dropbox_files(backup_context, dryrun):
         in_workdir = file_row["InWorkingDir"]
         in_s3 = file_row["InS3"]
         dropbox_file_abspath = backup_context.dropbox_camera_uploads_dir / dropbox_file_name
-        file_ext = pathlib.Path(dropbox_file_name).suffix
+        file_ext = os.path.splitext(dropbox_file_name)[1]
         if file_ext in (backup_context.video_file_extensions):
             workdir_file_abspath = backup_context.local_working_dir / "video" / dropbox_file_name
         else:
@@ -212,7 +226,7 @@ def rm_dropbox_files(backup_context, dryrun):
             # neither copy is corrupt
             if filecmp.cmp(dropbox_file_abspath, workdir_file_abspath, shallow=False):
                 if dryrun:
-                    click.echo("Exiting due to dry run; would have deleted Dropbox file '{}'".format(
+                    click.echo("[dry run] would have deleted Dropbox file '{}'".format(
                         dropbox_file_name))
                     continue
                 else:
@@ -235,28 +249,29 @@ def difflocal(backup_context):
     fmt = '{:<40}{:<20}'
     print(fmt.format(
         'File name',
-        'OK'))
+        'Status'))
     query = 'SELECT * FROM files ORDER BY Filename'
     for row in backup_context.dbcursor.execute(query):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
         dropbox_file_abspath = backup_context.dropbox_camera_uploads_dir / filename
-        file_ext = pathlib.Path(filename).suffix
+        file_ext = os.path.splitext(filename)[1]
         if file_ext in (backup_context.video_file_extensions):
             workdir_file_abspath = backup_context.local_working_dir / "video" / filename
         else:
             workdir_file_abspath = backup_context.local_working_dir / filename
-
-        if (in_dropbox == 1 and in_workdir == 0):
-            print(fmt.format(filename, "dropbox only"))
-        elif (in_dropbox == 0 and in_workdir == 1): 
-            print(fmt.format(filename, "workdir only"))
-        else:
+        if (in_dropbox == 1 and in_workdir == 1):
             if filecmp.cmp(dropbox_file_abspath, workdir_file_abspath, shallow=False):
-                print(fmt.format(filename, "👍"))
+                print(fmt.format(filename, "👍 diff OK"))
             else:
                 print(fmt.format(filename, "❌"))
+        elif (in_dropbox == 1 and in_workdir == 0): 
+            click.secho(fmt.format(filename, "dropbox only"), bg='red', fg='white')
+        elif (in_dropbox == 0 and in_workdir == 1):
+            click.secho(fmt.format(filename, "workdir only"))
+        elif (in_dropbox == 0 and in_workdir == 0 and in_s3 == 1): 
+            click.secho(fmt.format(filename, "s3 only"), bg='blue', fg='white')
 
 @cli.command()
 @pass_backup_context
@@ -266,43 +281,29 @@ def diffbucket(backup_context):
     fmt = '{:<40}{:<20}'
     print(fmt.format(
         'File name',
-        'OK'))
+        'Status'))
     query = 'SELECT * FROM files ORDER BY Filename'
     for row in backup_context.dbcursor.execute(query):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
         in_s3 = row["InS3"]
-        """
-        workdir_file_abspath = backup_context.local_working_dir / filename
-        file_ext = pathlib.Path(filename).suffix
-        if file_ext in (backup_context.video_file_extensions):
-            workdir_file_abspath = backup_context.local_working_dir / "video" / filename
-        else:
-            workdir_file_abspath = backup_context.local_working_dir / filename
-        """
         if (in_workdir == 1 and in_s3 == 1):
-            print(fmt.format(filename, "👍"))
-            # TODO - compare s3 etag checksum for file against md5 of local file
+            print(fmt.format(filename, "👍 found in s3 & workdir"))
+            # TODO - compare s3 etag checksum against md5 of local file
         elif (in_workdir == 1 and in_s3 == 0):
-            print(fmt.format(filename, "workdir only"))
+            click.secho(fmt.format(filename, "workdir only"), bg='red', fg='white')
         elif (in_workdir == 0 and in_s3 == 1): 
-            print(fmt.format(filename, "s3 only"))
-        elif (in_dropbox == 1): 
-            print(fmt.format(filename, "dropbox only"))
+            click.secho(fmt.format(filename, "s3 only"))
+        elif (in_workdir == 0 and in_s3 == 0 and in_dropbox == 1): 
+            click.secho(fmt.format(filename, "dropbox only"), bg='red', fg='white')
 
 @cli.command()
 @pass_backup_context
 @click.option('--dryrun', prompt='Dry run?', type=click.BOOL, default=True,
               help='The s3 bucket to upload files to.')
 def upload(backup_context, dryrun):
-    """Uploads local working dir files to an s3 bucket. For example:
-
-    ~/Pictures/s3/mybucket/photos/2016/08/iPhone6s/
-
-    Files in that dir will be copied to
-
-    s3://mybucket/photos/2016/08/iPhone6s/
+    """Uploads local working dir files to an s3 bucket.
     """
     for workdir_filename in backup_context.working_dir_filenames:
         file_row = backup_context.get_file_db_row(workdir_filename)
@@ -313,7 +314,7 @@ def upload(backup_context, dryrun):
 
         bucket_dest_images = backup_context.dir_prefix
         bucket_dest_videos = backup_context.dir_prefix + "/video"
-        file_ext = pathlib.Path(workdir_filename).suffix
+        file_ext = os.path.splitext(workdir_filename)[1]
         if file_ext in backup_context.video_file_extensions:
             bucket_root = bucket_dest_videos
             workdir_file_abspath = backup_context.local_working_dir / "video" / workdir_filename
@@ -321,12 +322,12 @@ def upload(backup_context, dryrun):
             bucket_root = bucket_dest_images
             workdir_file_abspath = backup_context.local_working_dir / workdir_filename
 
+        bucket_file_key = bucket_root + "/" + workdir_filename
         if dryrun:
             click.echo("Dry run; would have uploaded '{}' to s3 key '{}'".format(
-                workdir_filename, bucket_root))
+                workdir_filename, bucket_file_key))
             continue
         else:
-            bucket_file_key = bucket_root + "/" + workdir_filename
             click.echo("Uploading '{}' to s3 key '{}'".format(
                 workdir_file_abspath, bucket_file_key))
             backup_context.bucket.upload_file(
@@ -345,7 +346,7 @@ def lsbucket(backup_context):
 def lsdb(backup_context):
     """Populate and print DB rows for given year/month/device.
     """
-    pd.set_option('display.max_rows', 500)
+    pd.set_option('display.max_rows', 1000)
     print(pd.read_sql_query("SELECT * FROM files", backup_context.db))
 
 @cli.command()
