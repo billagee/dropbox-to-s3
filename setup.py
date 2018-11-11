@@ -1,15 +1,17 @@
 from setuptools import setup
 
 setup(
-    name='dropbox2s3',
+    name='drop2s3',
     version='0.1',
-    py_modules=['dropbox2s3'],
+    py_modules=['drop2s3'],
     include_package_data=True,
     install_requires=[
         'click',
+        'boto3',
+        'pandas'
     ],
     entry_points='''
         [console_scripts]
-        dropbox2s3=dropbox2s3:cli
+        drop2s3=drop2s3:cli
     ''',
 )

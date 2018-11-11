@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
- 
+
 import boto3
 import botocore
 import click
@@ -36,16 +36,19 @@ class BackupContext(object):
         self.year = year
         self.month = month
         self.device = device
-        self.dir_prefix = "photos/{year}/{month}/{device}".format(
+        self.dir_prefix = "photos/{year}/{month}/{device}/".format(
             year=self.year,
             month=self.month,
             device=self.device)
         self.dropbox_camera_uploads_dir = pathlib.Path(
             "{0}/Dropbox/Camera Uploads/".format(self.homedir))
-        self.local_working_dir = pathlib.Path(
-            "{homedir}/Pictures/s3/{bucket}/{dir_prefix}/".format(
+        self.local_bucket_dir = pathlib.Path(
+            "{homedir}/Pictures/s3/{bucket}/".format(
                 homedir=self.homedir,
-                bucket=self.bucket_name,
+                bucket=self.bucket_name))
+        self.local_working_dir = pathlib.Path(
+            "{local_bucket_dir}/{dir_prefix}".format(
+                local_bucket_dir=self.local_bucket_dir,
                 dir_prefix=self.dir_prefix))
         # The file extensions that we'll operate on
         self.supported_file_extensions = ["jpg", "png", "mov"]
@@ -65,9 +68,15 @@ class BackupContext(object):
         self.bucket_file_paths = [
             obj.key
             for obj
-            in self.bucket.objects.filter(Prefix=self.dir_prefix)]
+            in self.bucket.objects.filter(Prefix=self.dir_prefix)
+            if Path(obj.key).suffix is not '']
+        #import pdb ; pdb.set_trace()
         self.bucket_filenames = [
-            x.split("/")[-1] for x in self.bucket_file_paths]
+            Path(x).name
+            for x
+            in self.bucket_file_paths]
+        #    if Path(x).suffix is not '']
+        #    x.split("/")[-1] for x in self.bucket_file_paths]
         # Populate DB
         self.init_db()
 
@@ -91,17 +100,33 @@ class BackupContext(object):
         for file_name in self.working_dir_filenames:
             self.do_upsert_true_value_for_column(
                 file_name=file_name, column="InWorkingDir")
+        #import pdb ; pdb.set_trace()
         for file_name in self.bucket_filenames:
             self.do_upsert_true_value_for_column(
                 file_name=file_name, column="InS3")
 
     def do_upsert_true_value_for_column(self, file_name, column):
+        print("Inserting '{}' into column '{}'".format(file_name, column))
         self.dbcursor.execute("""
             INSERT INTO files (Filename, {column})
             VALUES ('{file_name}', 1)
             ON CONFLICT (Filename)
             DO UPDATE SET {column} = 1 WHERE Filename = '{file_name}'""".format(
                 file_name=file_name, column=column))
+        #self.dbcursor.execute("""
+        #    INSERT INTO files (Filename, :column)
+        #    VALUES (:file_name, 1)
+        #    ON CONFLICT (Filename)
+        #    DO UPDATE SET :column=1 WHERE Filename=:file_name""", {"column": column, "file_name": file_name})
+        self.db.commit()
+
+    def do_upsert_true_value_for_ins3_column(self, file_name, column):
+        print("Inserting '{}' into column '{}'".format(file_name, column))
+        self.dbcursor.execute("""
+            INSERT INTO files (Filename, InS3)
+            VALUES (:file_name, 1)
+            ON CONFLICT (Filename)
+            DO UPDATE SET InS3=1 WHERE Filename=:file_name""", {"file_name": file_name})
         self.db.commit()
 
     def get_file_db_row(self, file_name):
@@ -141,14 +166,14 @@ def cli(ctx, bucket_name, year, month, device):
     into a local working dir, then uploads the files to an s3 bucket.
 
     Example workflow:\n
-      dropbox2s3 mkdir\n
-      dropbox2s3 difflocal\n
-      dropbox2s3 cp\n
-      dropbox2s3 difflocal\n
-      dropbox2s3 diffbucket\n
-      dropbox2s3 upload\n
-      dropbox2s3 diffbucket\n
-      dropbox2s3 rm-dropbox-files
+      drop2s3 mkdir\n
+      drop2s3 difflocal\n
+      drop2s3 cp\n
+      drop2s3 difflocal\n
+      drop2s3 diffbucket\n
+      drop2s3 upload\n
+      drop2s3 diffbucket\n
+      drop2s3 rm-dropbox-files
     """
     # Create a BackupContext object and remember it as as the context object.
     # From this point onwards other commands can refer to it by using the
@@ -238,7 +263,8 @@ def rm_dropbox_files(backup_context, dryrun):
                 click.echo("Aborting clean; please investigate before continuing.")
                 sys.exit(1)
         else:
-            click.echo("Skipping rm of Dropbox file '{}'; it's not in both workdir and s3...".format(dropbox_file_name))
+            click.echo("Skipping rm of Dropbox file '{}'; it's not present in both workdir and s3...".format(dropbox_file_name))
+            click.echo("Please run the upload command to back the file up in s3 first.")
             continue
 
 @cli.command()
@@ -301,9 +327,68 @@ def diffbucket(backup_context):
 @cli.command()
 @pass_backup_context
 @click.option('--dryrun', prompt='Dry run?', type=click.BOOL, default=True,
-              help='The s3 bucket to upload files to.')
+              help='Do not actually upload files.')
 def upload(backup_context, dryrun):
     """Uploads local working dir files to an s3 bucket.
+    """
+    for workdir_filename in backup_context.working_dir_filenames:
+        file_row = backup_context.get_file_db_row(workdir_filename)
+        if file_row["InS3"]:
+            click.echo("Skipping file '{}'; it already exists in s3".format(
+                workdir_filename))
+            continue
+
+        bucket_dest_images = backup_context.dir_prefix
+        bucket_dest_videos = backup_context.dir_prefix + "video/"
+        file_ext = os.path.splitext(workdir_filename)[1]
+        if file_ext in backup_context.video_file_extensions:
+            bucket_root = bucket_dest_videos
+            workdir_file_abspath = backup_context.local_working_dir / "video" / workdir_filename
+        else:
+            bucket_root = bucket_dest_images
+            workdir_file_abspath = backup_context.local_working_dir / workdir_filename
+
+        bucket_file_key = bucket_root + workdir_filename
+        if dryrun:
+            click.echo("Dry run; would have uploaded '{}' to s3 key '{}'".format(
+                workdir_filename, bucket_file_key))
+            continue
+        else:
+            click.echo("Uploading '{}' to s3 key '{}'".format(
+                workdir_file_abspath, bucket_file_key))
+            backup_context.bucket.upload_file(
+                str(workdir_file_abspath), bucket_file_key)
+
+@cli.command()
+@pass_backup_context
+@click.option('--dryrun', prompt='Dry run?', type=click.BOOL, default=True,
+              help='Do not actually download files.')
+def download(backup_context, dryrun):
+    """Downloads files from s3 to local working dir.
+    """
+    if not dryrun:
+        backup_context.mkdir()
+    for key in backup_context.bucket_file_paths:
+        #workdir_dest_images = backup_context.dir_prefix
+        #workdir_dest_videos = backup_context.dir_prefix + "/video"
+        #file_ext = os.path.splitext(workdir_filename)[1]
+        #if file_ext in backup_context.video_file_extensions:
+        #    bucket_root = bucket_dest_videos
+        #    workdir_file_abspath = backup_context.local_working_dir / "video" / workdir_filename
+        #else:
+        #    bucket_root = bucket_dest_images
+        #    workdir_file_abspath = backup_context.local_working_dir / workdir_filename
+
+        #bucket_file_key = bucket_root + "/" + workdir_filename
+        if dryrun:
+            click.echo("Dry run; would have downloaded s3 key '{}' to '{}'".format(
+                key, backup_context.local_bucket_dir))
+            continue
+        else:
+            click.echo("Downloading s3 key '{}' to '{}'".format(
+                key, backup_context.local_bucket_dir))
+            backup_context.bucket.download_file(
+                key, str(backup_context.local_bucket_dir) / key)
     """
     for workdir_filename in backup_context.working_dir_filenames:
         file_row = backup_context.get_file_db_row(workdir_filename)
@@ -332,6 +417,7 @@ def upload(backup_context, dryrun):
                 workdir_file_abspath, bucket_file_key))
             backup_context.bucket.upload_file(
                 str(workdir_file_abspath), bucket_file_key)
+    """
  
 @cli.command()
 @pass_backup_context
@@ -364,3 +450,29 @@ def lsworkdir(backup_context):
     """
     for filename in backup_context.working_dir_filenames:
         print(filename)
+
+@cli.command()
+@pass_backup_context
+def sync_workdir(backup_context):
+    """s3 sync working dir contents for given year/month/device.
+    """
+    # TODO - use snippet from
+    # https://github.com/boto/boto3/issues/358#issuecomment-372086466
+    for filename in backup_context.working_dir_filenames:
+        print(filename)
+
+@cli.command()
+@click.pass_context
+@click.option('--dryrun', prompt='Dry run?', type=click.BOOL, default=True,
+              help='Print steps rather than execute them.')
+def workflow(backup_context, dryrun):
+    """Combines all commands into one.
+    """
+    print("in workflow")
+    backup_context.invoke(mkdir)
+    backup_context.invoke(difflocal)
+    click.confirm("About to copy files to workdir - do you want to continue?", abort=True)
+    backup_context.forward(cp)
+    click.confirm("About to upload files to s3 - do you want to continue?", abort=True)
+    backup_context.forward(upload)
+    click.echo("All done - to delete your files from Dropbox, run the rm-dropbox-files command.")
