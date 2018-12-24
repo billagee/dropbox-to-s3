@@ -8,7 +8,8 @@ setup(
     install_requires=[
         'click',
         'boto3',
-        'pandas'
+        'pandas',
+        'pathlib'
     ],
     entry_points='''
         [console_scripts]

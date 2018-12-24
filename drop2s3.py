@@ -57,6 +57,16 @@ class BackupContext(object):
         self.supported_file_extensions = ["jpg", "png", "mov"]
         self.video_file_extensions = [".mov"]
 
+        self.init_db()
+
+    def get_glob_pattern(self, file_ext):
+        if self.device == "NikonCoolpix":
+            pattern = "**/*DSCN*.{}".format(file_ext.upper())
+        else:
+            pattern = "**/{}-{}-*.{}".format(self.year, self.month, file_ext)
+        return pattern
+
+    def init_db(self):
         # Walk Dropbox and working dir paths and find all files matching
         # the given year/month.
         self.dropbox_filenames = []
@@ -73,22 +83,15 @@ class BackupContext(object):
             for obj in self.bucket.objects.filter(Prefix=self.dir_prefix)
             if Path(obj.key).suffix is not ""
         ]
-        # import pdb ; pdb.set_trace()
         self.bucket_filenames = [Path(x).name for x in self.bucket_file_paths]
         #    if Path(x).suffix is not '']
         #    x.split("/")[-1] for x in self.bucket_file_paths]
+
         # Populate DB
-        self.init_db()
-
-    def get_glob_pattern(self, file_ext):
-        if self.device == "NikonCoolpix":
-            pattern = "**/*DSCN*.{}".format(file_ext.upper())
-        else:
-            pattern = "**/{}-{}-*.{}".format(self.year, self.month, file_ext)
-        return pattern
-
-    def init_db(self):
         # TODO - add an IsVideo column so we don't have to check for .mov extension
+        self.dbcursor.execute(
+            """DROP TABLE IF EXISTS files"""
+        )
         self.dbcursor.execute(
             """CREATE TABLE files (
             Filename TEXT PRIMARY KEY,
@@ -104,12 +107,11 @@ class BackupContext(object):
             self.do_upsert_true_value_for_column(
                 file_name=file_name, column="InWorkingDir"
             )
-        # import pdb ; pdb.set_trace()
         for file_name in self.bucket_filenames:
             self.do_upsert_true_value_for_column(file_name=file_name, column="InS3")
 
     def do_upsert_true_value_for_column(self, file_name, column):
-        print("Inserting '{}' into column '{}'".format(file_name, column))
+        #print("Inserting '{}' into column '{}'".format(file_name, column))
         self.dbcursor.execute(
             """
             INSERT INTO files (Filename, {column})
@@ -127,7 +129,7 @@ class BackupContext(object):
         self.db.commit()
 
     def do_upsert_true_value_for_ins3_column(self, file_name, column):
-        print("Inserting '{}' into column '{}'".format(file_name, column))
+        #print("Inserting '{}' into column '{}'".format(file_name, column))
         self.dbcursor.execute(
             """
             INSERT INTO files (Filename, InS3)
@@ -348,8 +350,9 @@ def difflocal(backup_context):
                 print(fmt.format(filename, "❌"))
         elif in_dropbox == 1 and in_workdir == 0:
             click.secho(fmt.format(filename, "dropbox only"), bg="red", fg="white")
-        elif in_dropbox == 0 and in_workdir == 1:
-            click.secho(fmt.format(filename, "workdir only"))
+        # Silencing since this is a little verbose:
+        #elif in_dropbox == 0 and in_workdir == 1:
+        #    click.secho(fmt.format(filename, "workdir only"))
         elif in_dropbox == 0 and in_workdir == 0 and in_s3 == 1:
             click.secho(fmt.format(filename, "s3 only"), bg="blue", fg="white")
 
@@ -393,9 +396,10 @@ def upload(backup_context, dryrun):
     for workdir_filename in backup_context.working_dir_filenames:
         file_row = backup_context.get_file_db_row(workdir_filename)
         if file_row["InS3"]:
-            click.echo(
-                "Skipping file '{}'; it already exists in s3".format(workdir_filename)
-            )
+            # A little too noisy to always display:
+            #click.echo(
+            #    "Skipping file '{}'; it already exists in s3".format(workdir_filename)
+            #)
             continue
 
         bucket_dest_images = backup_context.dir_prefix
@@ -444,17 +448,6 @@ def download(backup_context, dryrun):
     if not dryrun:
         backup_context.mkdir()
     for key in backup_context.bucket_file_paths:
-        # workdir_dest_images = backup_context.dir_prefix
-        # workdir_dest_videos = backup_context.dir_prefix + "/video"
-        # file_ext = os.path.splitext(workdir_filename)[1]
-        # if file_ext in backup_context.video_file_extensions:
-        #    bucket_root = bucket_dest_videos
-        #    workdir_file_abspath = backup_context.local_working_dir / "video" / workdir_filename
-        # else:
-        #    bucket_root = bucket_dest_images
-        #    workdir_file_abspath = backup_context.local_working_dir / workdir_filename
-
-        # bucket_file_key = bucket_root + "/" + workdir_filename
         if dryrun:
             click.echo(
                 "Dry run; would have downloaded s3 key '{}' to '{}'".format(
@@ -471,35 +464,6 @@ def download(backup_context, dryrun):
             backup_context.bucket.download_file(
                 key, str(backup_context.local_bucket_dir) / key
             )
-    """
-    for workdir_filename in backup_context.working_dir_filenames:
-        file_row = backup_context.get_file_db_row(workdir_filename)
-        if file_row["InS3"]:
-            click.echo("Skipping file '{}'; it already exists in s3".format(
-                workdir_filename))
-            continue
-
-        bucket_dest_images = backup_context.dir_prefix
-        bucket_dest_videos = backup_context.dir_prefix + "/video"
-        file_ext = os.path.splitext(workdir_filename)[1]
-        if file_ext in backup_context.video_file_extensions:
-            bucket_root = bucket_dest_videos
-            workdir_file_abspath = backup_context.local_working_dir / "video" / workdir_filename
-        else:
-            bucket_root = bucket_dest_images
-            workdir_file_abspath = backup_context.local_working_dir / workdir_filename
-
-        bucket_file_key = bucket_root + "/" + workdir_filename
-        if dryrun:
-            click.echo("Dry run; would have uploaded '{}' to s3 key '{}'".format(
-                workdir_filename, bucket_file_key))
-            continue
-        else:
-            click.echo("Uploading '{}' to s3 key '{}'".format(
-                workdir_file_abspath, bucket_file_key))
-            backup_context.bucket.upload_file(
-                str(workdir_file_abspath), bucket_file_key)
-    """
 
 
 @cli.command()
@@ -567,8 +531,22 @@ def workflow(backup_context, dryrun):
         "About to copy files to workdir - do you want to continue?", abort=True
     )
     backup_context.forward(cp)
-    click.confirm("About to upload files to s3 - do you want to continue?", abort=True)
-    backup_context.forward(upload)
-    click.echo(
-        "All done - to delete your files from Dropbox, run the rm-dropbox-files command."
-    )
+    if dryrun:
+        print("Skipping s3 preview step since dryrun mode is on...")
+        # NOTE: This is skipped when in a dryrun, since no files were moved on
+        # disk in earlier steps, so we can't look at the disk or DB to display
+        # what we would actually be doing here...
+        # IDEA: What if copying or deleting files triggered an update to
+        # the DB, so that we could print what the current state would be?
+        # And the code paths that actually do modify files could either
+        # query the DB to figure out what to do, or a single function could
+        # "sync" the disk with the desired layout expressed in the DB state...
+    else:
+        click.confirm("About to upload files to s3 - do you want to continue?", abort=True)
+        # Reinitialize DB with updated paths, since we may have just moved
+        # files into the workdir
+        backup_context.obj.init_db()
+        backup_context.forward(upload)
+        click.echo(
+            "All done - to delete your files from Dropbox, run the rm-dropbox-files command."
+        )
