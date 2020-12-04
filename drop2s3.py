@@ -81,7 +81,7 @@ class BackupContext(object):
         self.bucket_file_paths = [
             obj.key
             for obj in self.bucket.objects.filter(Prefix=self.dir_prefix)
-            if Path(obj.key).suffix is not ""
+            if Path(obj.key).suffix != ""
         ]
         self.bucket_filenames = [Path(x).name for x in self.bucket_file_paths]
         #    if Path(x).suffix is not '']
@@ -337,6 +337,7 @@ def difflocal(backup_context):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
+        in_s3 = row["InS3"]
         dropbox_file_abspath = backup_context.dropbox_camera_uploads_dir / filename
         file_ext = os.path.splitext(filename)[1]
         if file_ext in (backup_context.video_file_extensions):
