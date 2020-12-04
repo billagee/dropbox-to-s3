@@ -54,8 +54,8 @@ class BackupContext(object):
             )
         )
         # The file extensions that we'll operate on
-        self.supported_file_extensions = ["jpg", "png", "mov"]
-        self.video_file_extensions = [".mov"]
+        self.supported_file_extensions = ["jpg", "png", "mov", "3gp", "heic", "mp4"]
+        self.video_file_extensions = [".mov", ".3gp", ".mp4"]
 
         self.init_db()
 
@@ -69,6 +69,8 @@ class BackupContext(object):
     def init_db(self):
         # Walk Dropbox and working dir paths and find all files matching
         # the given year/month.
+        # TODO - if we're asked to 'lsdropbox' then there's no need to glob
+        # other dir contents.
         self.dropbox_filenames = []
         self.working_dir_filenames = []
         for file_ext in self.supported_file_extensions:
@@ -89,6 +91,9 @@ class BackupContext(object):
 
         # Populate DB
         # TODO - add an IsVideo column so we don't have to check for .mov extension
+        # TODO
+        # Use dataset instead of raw queries:
+        # https://dataset.readthedocs.io/en/latest/
         self.dbcursor.execute(
             """DROP TABLE IF EXISTS files"""
         )
@@ -348,7 +353,7 @@ def difflocal(backup_context):
             if filecmp.cmp(dropbox_file_abspath, workdir_file_abspath, shallow=False):
                 print(fmt.format(filename, "👍 diff OK"))
             else:
-                print(fmt.format(filename, "❌"))
+                print(fmt.format(filename, "❌ diff NOT OK - files differ!"))
         elif in_dropbox == 1 and in_workdir == 0:
             click.secho(fmt.format(filename, "dropbox only"), bg="red", fg="white")
         # Silencing since this is a little verbose:
@@ -528,6 +533,8 @@ def workflow(backup_context, dryrun):
     """
     backup_context.invoke(mkdir)
     backup_context.invoke(difflocal)
+    # TODO - bail out if there's nothing in the dropbox folder, since
+    # there's nothing else we can do
     click.confirm(
         "About to copy files to workdir - do you want to continue?", abort=True
     )
