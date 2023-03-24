@@ -457,18 +457,19 @@ def download(backup_context, dryrun):
         if dryrun:
             click.echo(
                 "Dry run; would have downloaded s3 key '{}' to '{}'".format(
-                    key, backup_context.local_bucket_dir
+                    key, "{}/{}".format(backup_context.local_bucket_dir, key)
                 )
             )
             continue
         else:
             click.echo(
                 "Downloading s3 key '{}' to '{}'".format(
-                    key, backup_context.local_bucket_dir
+                    key, "{}/{}".format(backup_context.local_bucket_dir, key)
                 )
             )
             backup_context.bucket.download_file(
-                key, str(backup_context.local_bucket_dir) / key
+            #    key, str(backup_context.local_bucket_dir) / key
+                 key, "{}/{}".format(backup_context.local_bucket_dir, key)
             )
 
 

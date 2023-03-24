@@ -3,4 +3,4 @@
 # Install the local copy of the package from the files in ./
 virtualenv env
 . env/bin/activate
-pip install --editable .
+pip3 install --editable .

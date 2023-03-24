@@ -9,7 +9,7 @@ setup(
         'click',
         'boto3',
         'pandas',
-        'pathlib'
+        #'pathlib' # Included in python 3.4 and up
     ],
     entry_points='''
         [console_scripts]
