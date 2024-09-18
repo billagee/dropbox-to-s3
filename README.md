@@ -2,6 +2,12 @@
 
 A CLI backup tool to copy photos and videos from your `Dropbox/Camera Uploads/` dir to an S3 bucket.
 
+<p align="center">
+  <img width="600" src="https://raw.githubusercontent.com/billagee/dropbox-to-s3/refs/heads/master/misc/demo.svg">
+</p>
+
+> Example generated with `svg-term --cast=jPMTSpROLs9bSD8EJRWx6bhxC --out demo.svg --window`
+
 ## Installation
 
 Run this script to create a virtualenv and install `drop2s3` within it: 
@@ -45,4 +51,3 @@ Files from `Camera Uploads/` are sorted into directories following a `year/month
             └── video
                 └── 2024-02-01 17.34.02.mov
 ```
-### 
