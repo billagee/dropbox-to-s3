@@ -1,5 +1,7 @@
 # drop2s3
 
+![Test workflow](https://github.com/billagee/dropbox-to-s3/actions/workflows/test.yaml/badge.svg)
+
 A CLI backup tool to copy photos and videos from your `Dropbox/Camera Uploads/` dir to an S3 bucket.
 
 <p align="center">
