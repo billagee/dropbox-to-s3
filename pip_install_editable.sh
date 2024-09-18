@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
 # Install the local copy of the package from the files in ./
-virtualenv env
-. env/bin/activate
-pip3 install --editable .
+python3 -m venv env
+source env/bin/activate
+pip install --editable .

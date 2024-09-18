@@ -189,8 +189,8 @@ pass_backup_context = click.make_pass_decorator(BackupContext)
 @click.option(
     "--device",
     prompt="Device name",
-    default="iPhone6s",
-    help="The device name to use in the working dir path.",
+    default="default",
+    help="The device name to use in the working dir path (e.g. 'iPhone15').",
 )
 @click.pass_context
 def cli(ctx, bucket_name, year, month, device):
