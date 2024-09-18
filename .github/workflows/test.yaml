@@ -15,7 +15,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: [3.10]
+        python-version: ['3.10']
 
     steps:
     - name: Checkout repository
@@ -29,7 +29,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pytest click # boto3 pandas
+        pip install pytest click boto3 pandas
 
     - name: Run tests
       run: |
