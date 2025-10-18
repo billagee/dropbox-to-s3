@@ -1,167 +1,225 @@
 # -*- coding: utf-8 -*-
 
-import boto3
-import botocore
-import click
-from datetime import datetime
-import filecmp
-import os
-import pandas as pd
-import pathlib
-import sqlite3
-import sys
-from os.path import expanduser
-from os.path import splitext
-from pathlib import Path
-from shutil import copy2
-
 """
-* TODO: For any files in s3 that are missing in local workdir,
- download the bucket contents into the local directory layout
+drop2s3 - Backup utility for copying images/videos from Dropbox to S3.
 
-* NOTE: If you want to double-check consistency, consider syncing
+This utility copies image/video files from ~/Dropbox/Camera Uploads/
+into a local working directory, then uploads the files to an S3 bucket.
+
+TODO: For any files in S3 that are missing in local workdir,
+download the bucket contents into the local directory layout
+
+NOTE: If you want to double-check consistency, consider syncing
 your bucket to another dir (or machine), then diff that dir against
 the original local working dir
 """
 
+import os
+import sys
+import filecmp
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from shutil import copy2
+from typing import List, Optional
 
-class BackupContext(object):
-    def __init__(self, bucket_name, year, month, device):
+import boto3
+import click
+import pandas as pd
+
+# Configuration constants
+SUPPORTED_FILE_EXTENSIONS = ["jpg", "png", "mov", "3gp", "heic", "mp4"]
+VIDEO_FILE_EXTENSIONS = [".mov", ".3gp", ".mp4"]
+DROPBOX_CAMERA_DIR = "Dropbox/Camera Uploads/"
+LOCAL_PICTURES_DIR = "Pictures/s3/"
+S3_PREFIX_TEMPLATE = "photos/{year}/{month}/{device}/"
+
+
+class DatabaseManager:
+    """Manages the SQLite database for tracking file locations."""
+
+    def __init__(self):
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row
-        self.dbcursor = self.db.cursor()
-        self.s3 = boto3.resource("s3")
-        self.bucket = self.s3.Bucket(bucket_name)
-        self.homedir = expanduser("~")
-        self.bucket_name = bucket_name
-        self.year = year
-        self.month = month
-        self.device = device
-        self.dir_prefix = "photos/{year}/{month}/{device}/".format(
-            year=self.year, month=self.month, device=self.device
-        )
-        self.dropbox_camera_uploads_dir = pathlib.Path(
-            "{0}/Dropbox/Camera Uploads/".format(self.homedir)
-        )
-        self.local_bucket_dir = pathlib.Path(
-            "{homedir}/Pictures/s3/{bucket}/".format(
-                homedir=self.homedir, bucket=self.bucket_name
-            )
-        )
-        self.local_working_dir = pathlib.Path(
-            "{local_bucket_dir}/{dir_prefix}".format(
-                local_bucket_dir=self.local_bucket_dir, dir_prefix=self.dir_prefix
-            )
-        )
-        # The file extensions that we'll operate on
-        self.supported_file_extensions = ["jpg", "png", "mov", "3gp", "heic", "mp4"]
-        self.video_file_extensions = [".mov", ".3gp", ".mp4"]
+        self.cursor = self.db.cursor()
+        self._init_schema()
 
-        self.init_db()
-
-    def get_glob_pattern(self, file_ext):
-        if self.device == "NikonCoolpix":
-            pattern = "**/*DSCN*.{}".format(file_ext.upper())
-        else:
-            pattern = "**/{}-{}-*.{}".format(self.year, self.month, file_ext)
-        return pattern
-
-    def init_db(self):
-        # Walk Dropbox and working dir paths and find all files matching
-        # the given year/month.
-        # TODO - if we're asked to 'lsdropbox' then there's no need to glob
-        # other dir contents.
-        self.dropbox_filenames = []
-        self.working_dir_filenames = []
-        for file_ext in self.supported_file_extensions:
-            pattern = self.get_glob_pattern(file_ext)
-            dropbox_glob = self.dropbox_camera_uploads_dir.glob(pattern)
-            self.dropbox_filenames.extend([x.name for x in sorted(dropbox_glob)])
-            workdir_glob = self.local_working_dir.glob(pattern)
-            self.working_dir_filenames.extend([x.name for x in sorted(workdir_glob)])
-        # Get bucket contents for year/month/device
-        self.bucket_file_paths = [
-            obj.key
-            for obj in self.bucket.objects.filter(Prefix=self.dir_prefix)
-            if Path(obj.key).suffix != ""
-        ]
-        self.bucket_filenames = [Path(x).name for x in self.bucket_file_paths]
-        #    if Path(x).suffix is not '']
-        #    x.split("/")[-1] for x in self.bucket_file_paths]
-
-        # Populate DB
-        # TODO - add an IsVideo column so we don't have to check for .mov extension
-        # TODO
-        # Use dataset instead of raw queries:
-        # https://dataset.readthedocs.io/en/latest/
-        self.dbcursor.execute(
-            """DROP TABLE IF EXISTS files"""
-        )
-        self.dbcursor.execute(
+    def _init_schema(self):
+        """Initialize the database schema."""
+        self.cursor.execute("DROP TABLE IF EXISTS files")
+        self.cursor.execute(
             """CREATE TABLE files (
             Filename TEXT PRIMARY KEY,
             InDropbox INTEGER DEFAULT 0,
             InWorkingDir INTEGER DEFAULT 0,
             InS3 INTEGER DEFAULT 0)"""
         )
-        for file_name in self.dropbox_filenames:
-            self.do_upsert_true_value_for_column(
-                file_name=file_name, column="InDropbox"
-            )
-        for file_name in self.working_dir_filenames:
-            self.do_upsert_true_value_for_column(
-                file_name=file_name, column="InWorkingDir"
-            )
-        for file_name in self.bucket_filenames:
-            self.do_upsert_true_value_for_column(file_name=file_name, column="InS3")
+        self.db.commit()
 
-    def do_upsert_true_value_for_column(self, file_name, column):
-        #print("Inserting '{}' into column '{}'".format(file_name, column))
-        self.dbcursor.execute(
-            """
+    def upsert_file_location(self, file_name: str, column: str):
+        """
+        Insert or update a file's location status.
+
+        Args:
+            file_name: Name of the file
+            column: Column to update (InDropbox, InWorkingDir, or InS3)
+        """
+        # Use parameterized query to prevent SQL injection
+        query = f"""
             INSERT INTO files (Filename, {column})
-            VALUES ('{file_name}', 1)
+            VALUES (?, 1)
             ON CONFLICT (Filename)
-            DO UPDATE SET {column} = 1 WHERE Filename = '{file_name}'""".format(
-                file_name=file_name, column=column
-            )
-        )
-        # self.dbcursor.execute("""
-        #    INSERT INTO files (Filename, :column)
-        #    VALUES (:file_name, 1)
-        #    ON CONFLICT (Filename)
-        #    DO UPDATE SET :column=1 WHERE Filename=:file_name""", {"column": column, "file_name": file_name})
+            DO UPDATE SET {column} = 1 WHERE Filename = ?
+        """
+        self.cursor.execute(query, (file_name, file_name))
         self.db.commit()
 
-    def do_upsert_true_value_for_ins3_column(self, file_name, column):
-        #print("Inserting '{}' into column '{}'".format(file_name, column))
-        self.dbcursor.execute(
-            """
-            INSERT INTO files (Filename, InS3)
-            VALUES (:file_name, 1)
-            ON CONFLICT (Filename)
-            DO UPDATE SET InS3=1 WHERE Filename=:file_name""",
-            {"file_name": file_name},
-        )
-        self.db.commit()
+    def get_file_row(self, file_name: str) -> Optional[sqlite3.Row]:
+        """
+        Get database row for a specific file.
 
-    def get_file_db_row(self, file_name):
+        Args:
+            file_name: Name of the file to query
+
+        Returns:
+            Database row or None if not found
+        """
         query = "SELECT * FROM files WHERE Filename = ?"
-        row = self.dbcursor.execute(query, (file_name,)).fetchone()
-        return row
+        return self.cursor.execute(query, (file_name,)).fetchone()
+
+    def execute_query(self, query: str):
+        """Execute a SQL query and return the cursor."""
+        return self.cursor.execute(query)
+
+
+class BackupContext:
+    """Context object for managing backup operations between Dropbox and S3."""
+
+    def __init__(self, bucket_name: str, year: str, month: str, device: str):
+        # Core configuration
+        self.bucket_name = bucket_name
+        self.year = year
+        self.month = month
+        self.device = device
+        self.homedir = Path.home()
+
+        # S3 setup
+        self.s3 = boto3.resource("s3")
+        self.bucket = self.s3.Bucket(bucket_name)
+        self.dir_prefix = S3_PREFIX_TEMPLATE.format(
+            year=self.year, month=self.month, device=self.device
+        )
+
+        # Directory paths
+        self.dropbox_camera_uploads_dir = self.homedir / DROPBOX_CAMERA_DIR
+        self.local_bucket_dir = self.homedir / LOCAL_PICTURES_DIR / self.bucket_name
+        self.local_working_dir = self.local_bucket_dir / self.dir_prefix
+
+        # File extension configuration
+        self.supported_file_extensions = SUPPORTED_FILE_EXTENSIONS
+        self.video_file_extensions = VIDEO_FILE_EXTENSIONS
+
+        # Initialize database
+        self.db_manager = DatabaseManager()
+        self.db = self.db_manager.db  # For backward compatibility
+        self.dbcursor = self.db_manager.cursor  # For backward compatibility
+
+        self.init_db()
+
+    def get_glob_pattern(self, file_ext: str) -> str:
+        """
+        Get the glob pattern for finding files based on device and file extension.
+
+        Args:
+            file_ext: File extension to search for
+
+        Returns:
+            Glob pattern string
+        """
+        if self.device == "NikonCoolpix":
+            return f"**/*DSCN*.{file_ext.upper()}"
+        return f"**/{self.year}-{self.month}-*.{file_ext}"
+
+    def get_file_destination_path(self, filename: str, base_dir: Path) -> Path:
+        """
+        Get the destination path for a file (handles video subdirectory).
+
+        Args:
+            filename: Name of the file
+            base_dir: Base directory path
+
+        Returns:
+            Full destination path for the file
+        """
+        file_ext = os.path.splitext(filename)[1]
+        if file_ext in self.video_file_extensions:
+            return base_dir / "video" / filename
+        return base_dir / filename
+
+    def init_db(self):
+        """
+        Initialize the database by scanning Dropbox, working directory, and S3.
+
+        Populates the database with file locations from all three sources.
+        """
+        # Scan local directories for files matching year/month pattern
+        self.dropbox_filenames = self._scan_directory(self.dropbox_camera_uploads_dir)
+        self.working_dir_filenames = self._scan_directory(self.local_working_dir)
+
+        # Get S3 bucket contents for year/month/device
+        self.bucket_file_paths = [
+            obj.key
+            for obj in self.bucket.objects.filter(Prefix=self.dir_prefix)
+            if Path(obj.key).suffix != ""
+        ]
+        self.bucket_filenames = [Path(x).name for x in self.bucket_file_paths]
+
+        # Populate database with file locations
+        for file_name in self.dropbox_filenames:
+            self.db_manager.upsert_file_location(file_name, "InDropbox")
+        for file_name in self.working_dir_filenames:
+            self.db_manager.upsert_file_location(file_name, "InWorkingDir")
+        for file_name in self.bucket_filenames:
+            self.db_manager.upsert_file_location(file_name, "InS3")
+
+    def _scan_directory(self, directory: Path) -> List[str]:
+        """
+        Scan a directory for files matching supported extensions.
+
+        Args:
+            directory: Directory path to scan
+
+        Returns:
+            List of filenames found
+        """
+        filenames = []
+        for file_ext in self.supported_file_extensions:
+            pattern = self.get_glob_pattern(file_ext)
+            file_glob = directory.glob(pattern)
+            filenames.extend([x.name for x in sorted(file_glob)])
+        return filenames
+
+    def get_file_db_row(self, file_name: str) -> Optional[sqlite3.Row]:
+        """
+        Get database row for a specific file.
+
+        Args:
+            file_name: Name of the file to query
+
+        Returns:
+            Database row or None if not found
+        """
+        return self.db_manager.get_file_row(file_name)
 
     def mkdir(self):
-        if not os.path.exists(self.local_working_dir):
-            click.echo(
-                "About to create working dir at {}".format(self.local_working_dir)
-            )
+        """Create the local working directory if it doesn't exist."""
+        if not self.local_working_dir.exists():
+            click.echo(f"About to create working dir at {self.local_working_dir}")
             click.confirm("Do you want to continue?", abort=True)
-            # Append /video to working dir path since videos are stored separately
-            os.makedirs(self.local_working_dir / "video")
+            # Create working dir and video subdirectory
+            (self.local_working_dir / "video").mkdir(parents=True, exist_ok=True)
         else:
-            click.echo(
-                "Working dir already exists at {}".format(self.local_working_dir)
-            )
+            click.echo(f"Working dir already exists at {self.local_working_dir}")
 
     def __repr__(self):
         return "<BackupContext %r>" % self.local_working_dir
@@ -236,37 +294,25 @@ def cp(backup_context, dryrun):
     """
     # Check for working dir and run mkdir() if it doesn't exist
     backup_context.mkdir()
-    click.echo(
-        "About to copy files from: {}".format(backup_context.dropbox_camera_uploads_dir)
-    )
-    click.echo("To local working dir: {}".format(backup_context.local_working_dir))
-    dest_images = backup_context.local_working_dir
-    dest_videos = backup_context.local_working_dir / "video"
+    click.echo(f"About to copy files from: {backup_context.dropbox_camera_uploads_dir}")
+    click.echo(f"To local working dir: {backup_context.local_working_dir}")
 
     for dropbox_file_name in backup_context.dropbox_filenames:
         file_row = backup_context.get_file_db_row(dropbox_file_name)
         if file_row["InWorkingDir"]:
-            click.echo(
-                "Skipping file '{}'; it already exists in workdir".format(
-                    dropbox_file_name
-                )
-            )
+            click.echo(f"Skipping file '{dropbox_file_name}'; it already exists in workdir")
             continue
-        # Set destination dir
-        file_ext = os.path.splitext(dropbox_file_name)[1]
-        if file_ext in backup_context.video_file_extensions:
-            dest_root = dest_videos
-        else:
-            dest_root = dest_images
+
+        # Get destination path using helper method
+        dest_path = backup_context.get_file_destination_path(
+            dropbox_file_name, backup_context.local_working_dir
+        )
+
         if dryrun:
-            click.echo(
-                "Dry run; would have copied '{}' to workdir".format(dropbox_file_name)
-            )
+            click.echo(f"Dry run; would have copied '{dropbox_file_name}' to workdir")
         else:
-            click.echo("Copying '{}' to {}".format(dropbox_file_name, dest_root))
-            copy2(
-                backup_context.dropbox_camera_uploads_dir / dropbox_file_name, dest_root
-            )
+            click.echo(f"Copying '{dropbox_file_name}' to {dest_path.parent}")
+            copy2(backup_context.dropbox_camera_uploads_dir / dropbox_file_name, dest_path)
 
 
 @cli.command()
@@ -279,86 +325,67 @@ def cp(backup_context, dryrun):
     help="Do not actually delete files.",
 )
 def rm_dropbox_files(backup_context, dryrun):
-    """Delete backed-up files in your Camera Uploads dir.
-    """
-    # Double check that all the files to be deleted in Dropbox also exist
-    # in the working dir and s3:
+    """Delete backed-up files in your Camera Uploads dir."""
+    # Verify files exist in both working dir and S3 before deletion
     click.echo("Checking for Dropbox files in workdir and s3...")
     for dropbox_file_name in backup_context.dropbox_filenames:
         file_row = backup_context.get_file_db_row(dropbox_file_name)
         in_workdir = file_row["InWorkingDir"]
         in_s3 = file_row["InS3"]
-        dropbox_file_abspath = (
-            backup_context.dropbox_camera_uploads_dir / dropbox_file_name
+
+        dropbox_file_path = backup_context.dropbox_camera_uploads_dir / dropbox_file_name
+        workdir_file_path = backup_context.get_file_destination_path(
+            dropbox_file_name, backup_context.local_working_dir
         )
-        file_ext = os.path.splitext(dropbox_file_name)[1]
-        if file_ext in (backup_context.video_file_extensions):
-            workdir_file_abspath = (
-                backup_context.local_working_dir / "video" / dropbox_file_name
-            )
-        else:
-            workdir_file_abspath = backup_context.local_working_dir / dropbox_file_name
+
         if in_workdir and in_s3:
-            # Before rm'ing, diff the dropbox and workdir files to make sure
-            # neither copy is corrupt
-            if filecmp.cmp(dropbox_file_abspath, workdir_file_abspath, shallow=False):
+            # Verify file integrity before deletion
+            if filecmp.cmp(dropbox_file_path, workdir_file_path, shallow=False):
                 if dryrun:
-                    click.echo(
-                        "[dry run] would have deleted Dropbox file '{}'".format(
-                            dropbox_file_name
-                        )
-                    )
-                    continue
+                    click.echo(f"[dry run] would have deleted Dropbox file '{dropbox_file_name}'")
                 else:
-                    click.echo("Deleting {}...".format(dropbox_file_abspath))
-                    os.remove(dropbox_file_abspath)
+                    click.echo(f"Deleting {dropbox_file_path}...")
+                    os.remove(dropbox_file_path)
             else:
                 click.echo(
-                    "Error: cmp() failed for Dropbox file '{}' and its workdir backup '{}'!".format(
-                        dropbox_file_name, workdir_file_abspath
-                    )
+                    f"Error: Files differ! Dropbox: '{dropbox_file_name}', "
+                    f"Workdir: '{workdir_file_path}'"
                 )
                 click.echo("Aborting clean; please investigate before continuing.")
                 sys.exit(1)
         else:
             click.echo(
-                "Skipping rm of Dropbox file '{}'; it's not present in both workdir and s3...".format(
-                    dropbox_file_name
-                )
+                f"Skipping rm of Dropbox file '{dropbox_file_name}'; "
+                "it's not present in both workdir and s3..."
             )
             click.echo("Please run the upload command to back the file up in s3 first.")
-            continue
 
 
 @cli.command()
 @pass_backup_context
 def difflocal(backup_context):
-    """Diff Dropbox and working dir contents.
-    """
+    """Diff Dropbox and working dir contents."""
     fmt = "{:<40}{:<20}"
     print(fmt.format("File name", "Status"))
     query = "SELECT * FROM files ORDER BY Filename"
-    for row in backup_context.dbcursor.execute(query):
+    for row in backup_context.db_manager.execute_query(query):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
         in_s3 = row["InS3"]
-        dropbox_file_abspath = backup_context.dropbox_camera_uploads_dir / filename
-        file_ext = os.path.splitext(filename)[1]
-        if file_ext in (backup_context.video_file_extensions):
-            workdir_file_abspath = backup_context.local_working_dir / "video" / filename
-        else:
-            workdir_file_abspath = backup_context.local_working_dir / filename
+
+        dropbox_file_path = backup_context.dropbox_camera_uploads_dir / filename
+        workdir_file_path = backup_context.get_file_destination_path(
+            filename, backup_context.local_working_dir
+        )
+
         if in_dropbox == 1 and in_workdir == 1:
-            if filecmp.cmp(dropbox_file_abspath, workdir_file_abspath, shallow=False):
-                print(fmt.format(filename, "👍 diff OK"))
+            if filecmp.cmp(dropbox_file_path, workdir_file_path, shallow=False):
+                print(fmt.format(filename, "diff OK"))
             else:
-                print(fmt.format(filename, "❌ diff NOT OK - files differ!"))
+                print(fmt.format(filename, "diff NOT OK - files differ!"))
         elif in_dropbox == 1 and in_workdir == 0:
             click.secho(fmt.format(filename, "dropbox only"), bg="red", fg="white")
-        # Silencing since this is a little verbose:
-        #elif in_dropbox == 0 and in_workdir == 1:
-        #    click.secho(fmt.format(filename, "workdir only"))
         elif in_dropbox == 0 and in_workdir == 0 and in_s3 == 1:
             click.secho(fmt.format(filename, "s3 only"), bg="blue", fg="white")
 
@@ -366,19 +393,18 @@ def difflocal(backup_context):
 @cli.command()
 @pass_backup_context
 def diffbucket(backup_context):
-    """Diff working dir and s3 bucket contents.
-    """
+    """Diff working dir and s3 bucket contents."""
     fmt = "{:<40}{:<20}"
     print(fmt.format("File name", "Status"))
     query = "SELECT * FROM files ORDER BY Filename"
-    for row in backup_context.dbcursor.execute(query):
+    for row in backup_context.db_manager.execute_query(query):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
         in_s3 = row["InS3"]
+
         if in_workdir == 1 and in_s3 == 1:
-            print(fmt.format(filename, "👍 found in s3 & workdir"))
-            # TODO - compare s3 etag checksum against md5 of local file
+            print(fmt.format(filename, "found in s3 & workdir"))
         elif in_workdir == 1 and in_s3 == 0:
             click.secho(fmt.format(filename, "workdir only"), bg="red", fg="white")
         elif in_workdir == 0 and in_s3 == 1:
@@ -397,46 +423,28 @@ def diffbucket(backup_context):
     help="Do not actually upload files.",
 )
 def upload(backup_context, dryrun):
-    """Uploads local working dir files to an s3 bucket.
-    """
+    """Uploads local working dir files to an s3 bucket."""
     for workdir_filename in backup_context.working_dir_filenames:
         file_row = backup_context.get_file_db_row(workdir_filename)
         if file_row["InS3"]:
-            # A little too noisy to always display:
-            #click.echo(
-            #    "Skipping file '{}'; it already exists in s3".format(workdir_filename)
-            #)
-            continue
+            continue  # File already exists in S3
 
-        bucket_dest_images = backup_context.dir_prefix
-        bucket_dest_videos = backup_context.dir_prefix + "video/"
+        # Determine S3 key path based on file type
         file_ext = os.path.splitext(workdir_filename)[1]
         if file_ext in backup_context.video_file_extensions:
-            bucket_root = bucket_dest_videos
-            workdir_file_abspath = (
-                backup_context.local_working_dir / "video" / workdir_filename
-            )
+            bucket_key = backup_context.dir_prefix + "video/" + workdir_filename
         else:
-            bucket_root = bucket_dest_images
-            workdir_file_abspath = backup_context.local_working_dir / workdir_filename
+            bucket_key = backup_context.dir_prefix + workdir_filename
 
-        bucket_file_key = bucket_root + workdir_filename
+        workdir_file_path = backup_context.get_file_destination_path(
+            workdir_filename, backup_context.local_working_dir
+        )
+
         if dryrun:
-            click.echo(
-                "Dry run; would have uploaded '{}' to s3 key '{}'".format(
-                    workdir_filename, bucket_file_key
-                )
-            )
-            continue
+            click.echo(f"Dry run; would have uploaded '{workdir_filename}' to s3 key '{bucket_key}'")
         else:
-            click.echo(
-                "Uploading '{}' to s3 key '{}'".format(
-                    workdir_file_abspath, bucket_file_key
-                )
-            )
-            backup_context.bucket.upload_file(
-                str(workdir_file_abspath), bucket_file_key
-            )
+            click.echo(f"Uploading '{workdir_file_path}' to s3 key '{bucket_key}'")
+            backup_context.bucket.upload_file(str(workdir_file_path), bucket_key)
 
 
 @cli.command()
@@ -449,28 +457,20 @@ def upload(backup_context, dryrun):
     help="Do not actually download files.",
 )
 def download(backup_context, dryrun):
-    """Downloads files from s3 to local working dir.
-    """
+    """Downloads files from s3 to local working dir."""
     if not dryrun:
         backup_context.mkdir()
+
     for key in backup_context.bucket_file_paths:
+        dest_path = backup_context.local_bucket_dir / key
+
         if dryrun:
-            click.echo(
-                "Dry run; would have downloaded s3 key '{}' to '{}'".format(
-                    key, "{}/{}".format(backup_context.local_bucket_dir, key)
-                )
-            )
-            continue
+            click.echo(f"Dry run; would have downloaded s3 key '{key}' to '{dest_path}'")
         else:
-            click.echo(
-                "Downloading s3 key '{}' to '{}'".format(
-                    key, "{}/{}".format(backup_context.local_bucket_dir, key)
-                )
-            )
-            backup_context.bucket.download_file(
-            #    key, str(backup_context.local_bucket_dir) / key
-                 key, "{}/{}".format(backup_context.local_bucket_dir, key)
-            )
+            click.echo(f"Downloading s3 key '{key}' to '{dest_path}'")
+            # Ensure parent directory exists
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_context.bucket.download_file(key, str(dest_path))
 
 
 @cli.command()
@@ -530,32 +530,18 @@ def sync_workdir(backup_context):
     help="Print steps rather than execute them.",
 )
 def workflow(backup_context, dryrun):
-    """Runs all commands for a typical backup workflow.
-    """
+    """Runs all commands for a typical backup workflow."""
     backup_context.invoke(mkdir)
     backup_context.invoke(difflocal)
-    # TODO - bail out if there's nothing in the dropbox folder, since
-    # there's nothing else we can do
-    click.confirm(
-        "About to copy files to workdir - do you want to continue?", abort=True
-    )
+
+    click.confirm("About to copy files to workdir - do you want to continue?", abort=True)
     backup_context.forward(cp)
+
     if dryrun:
         print("Skipping s3 preview step since dryrun mode is on...")
-        # NOTE: This is skipped when in a dryrun, since no files were moved on
-        # disk in earlier steps, so we can't look at the disk or DB to display
-        # what we would actually be doing here...
-        # IDEA: What if copying or deleting files triggered an update to
-        # the DB, so that we could print what the current state would be?
-        # And the code paths that actually do modify files could either
-        # query the DB to figure out what to do, or a single function could
-        # "sync" the disk with the desired layout expressed in the DB state...
     else:
         click.confirm("About to upload files to s3 - do you want to continue?", abort=True)
-        # Reinitialize DB with updated paths, since we may have just moved
-        # files into the workdir
+        # Reinitialize DB with updated paths after copying files
         backup_context.obj.init_db()
         backup_context.forward(upload)
-        click.echo(
-            "All done - to delete your files from Dropbox, run the rm-dropbox-files command."
-        )
+        click.echo("All done - to delete your files from Dropbox, run the rm-dropbox-files command.")
