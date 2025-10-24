@@ -15,13 +15,14 @@ the original local working dir
 """
 
 import os
+import re
 import sys
 import filecmp
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from shutil import copy2
-from typing import List, Optional
+from typing import List, Optional, Dict, Set
 
 import boto3
 import click
@@ -33,6 +34,88 @@ VIDEO_FILE_EXTENSIONS = [".mov", ".3gp", ".mp4"]
 DROPBOX_CAMERA_DIR = "Dropbox/Camera Uploads/"
 LOCAL_PICTURES_DIR = "Pictures/s3/"
 S3_PREFIX_TEMPLATE = "photos/{year}/{month}/{device}/"
+
+
+def detect_year_month_combinations(dropbox_dir: Path) -> List[Dict[str, str]]:
+    """
+    Scan Dropbox Camera Uploads directory and detect all year/month combinations.
+
+    Args:
+        dropbox_dir: Path to Dropbox Camera Uploads directory
+
+    Returns:
+        List of dictionaries with 'year' and 'month' keys, sorted by year and month
+    """
+    year_month_set: Set[tuple] = set()
+
+    # Pattern to match Dropbox filename format: YYYY-MM-DD-*
+    # Example: 2024-10-15-IMG_001.jpg
+    date_pattern = re.compile(r'^(\d{4})-(\d{2})-\d{2}')
+
+    if not dropbox_dir.exists():
+        click.echo(f"Warning: Dropbox directory not found at {dropbox_dir}")
+        return []
+
+    # Scan all files in the directory
+    for file_path in dropbox_dir.glob('**/*'):
+        if file_path.is_file():
+            match = date_pattern.match(file_path.name)
+            if match:
+                year, month = match.groups()
+                year_month_set.add((year, month))
+
+    # Convert to sorted list of dictionaries
+    sorted_combinations = sorted(year_month_set)
+    return [{'year': year, 'month': month} for year, month in sorted_combinations]
+
+
+def prompt_user_for_year_month(combinations: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """
+    Present detected year/month combinations to user and get their selection.
+
+    Args:
+        combinations: List of year/month combination dictionaries
+
+    Returns:
+        Selected year/month dictionary, or None if cancelled
+    """
+    if not combinations:
+        click.echo("No files with year/month format found in Dropbox Camera Uploads.")
+        return None
+
+    click.echo("\nDetected the following year/month combinations in Dropbox Camera Uploads:\n")
+
+    for idx, combo in enumerate(combinations, 1):
+        click.echo(f"  {idx}. {combo['year']}-{combo['month']}")
+
+    click.echo()
+
+    # Prompt user for selection
+    while True:
+        choice = click.prompt(
+            "Enter the number of the year/month to process (or 'q' to quit)",
+            type=str
+        )
+
+        if choice.lower() == 'q':
+            return None
+
+        try:
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(combinations):
+                selected = combinations[choice_idx]
+                click.echo(f"\nSelected: {selected['year']}-{selected['month']}")
+
+                # Ask for confirmation
+                if click.confirm("\nProceed with copying these files to S3?"):
+                    return selected
+                else:
+                    click.echo("Operation cancelled.")
+                    return None
+            else:
+                click.echo(f"Please enter a number between 1 and {len(combinations)}")
+        except ValueError:
+            click.echo("Invalid input. Please enter a number or 'q' to quit.")
 
 
 class DatabaseManager:
@@ -234,15 +317,13 @@ pass_backup_context = click.make_pass_decorator(BackupContext)
 )
 @click.option(
     "--year",
-    prompt="Photo year",
-    default="{:02}".format(datetime.today().year),
-    help="The year dir to use in the working dir path (e.g. 2017).",
+    default=None,
+    help="The year dir to use in the working dir path (e.g. 2017). If not provided, will auto-detect from Dropbox files.",
 )
 @click.option(
     "--month",
-    prompt="Photo month",
-    default="{:02}".format(datetime.today().month),
-    help="The month dir to use in the working dir path (e.g. 09).",
+    default=None,
+    help="The month dir to use in the working dir path (e.g. 09). If not provided, will auto-detect from Dropbox files.",
 )
 @click.option(
     "--device",
@@ -256,11 +337,35 @@ def cli(ctx, bucket_name, year, month, device):
     This utility copies image/video files from ~/Dropbox/Camera Uploads/
     into a local working dir, then uploads the files to an s3 bucket.
 
+    If --year and --month are not provided, the tool will automatically scan
+    your Dropbox Camera Uploads directory, detect available year/month combinations,
+    and present them for you to choose.
+
     Example usage:\n
-      drop2s3 workflow\n
+      drop2s3 workflow  # Auto-detects year/month\n
+      drop2s3 --year 2024 --month 10 workflow  # Explicitly specify year/month\n
       drop2s3 diffbucket\n
       drop2s3 rm-dropbox-files
     """
+    # Auto-detect year/month if not provided
+    if year is None or month is None:
+        dropbox_dir = Path.home() / DROPBOX_CAMERA_DIR
+        combinations = detect_year_month_combinations(dropbox_dir)
+
+        if not combinations:
+            click.echo("No files with year/month format found in Dropbox Camera Uploads.")
+            click.echo("Please specify --year and --month parameters explicitly.")
+            ctx.abort()
+
+        selected = prompt_user_for_year_month(combinations)
+
+        if selected is None:
+            click.echo("No selection made. Exiting.")
+            ctx.abort()
+
+        year = selected['year']
+        month = selected['month']
+
     # Create a BackupContext object and remember it as as the context object.
     # From this point onwards other commands can refer to it by using the
     # @pass_backup_context decorator.
