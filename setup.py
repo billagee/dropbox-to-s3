@@ -6,7 +6,7 @@ setup(
     py_modules=['drop2s3'],
     include_package_data=True,
     install_requires=[
-        'click',
+        'typer[all]>=0.9.0',
         'boto3',
         'pandas',
         #'pathlib' # Included in python 3.4 and up

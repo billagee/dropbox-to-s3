@@ -24,7 +24,7 @@ from shutil import copy2
 from typing import List, Optional
 
 import boto3
-import click
+import typer
 import pandas as pd
 
 # Configuration constants
@@ -33,6 +33,9 @@ VIDEO_FILE_EXTENSIONS = [".mov", ".3gp", ".mp4"]
 DROPBOX_CAMERA_DIR = "Dropbox/Camera Uploads/"
 LOCAL_PICTURES_DIR = "Pictures/s3/"
 S3_PREFIX_TEMPLATE = "photos/{year}/{month}/{device}/"
+
+# Global context - initialized by callback
+_backup_context: Optional["BackupContext"] = None
 
 
 class DatabaseManager:
@@ -214,170 +217,170 @@ class BackupContext:
     def mkdir(self):
         """Create the local working directory if it doesn't exist."""
         if not self.local_working_dir.exists():
-            click.echo(f"About to create working dir at {self.local_working_dir}")
-            click.confirm("Do you want to continue?", abort=True)
+            typer.echo(f"About to create working dir at {self.local_working_dir}")
+            typer.confirm("Do you want to continue?", abort=True)
             # Create working dir and video subdirectory
             (self.local_working_dir / "video").mkdir(parents=True, exist_ok=True)
         else:
-            click.echo(f"Working dir already exists at {self.local_working_dir}")
+            typer.echo(f"Working dir already exists at {self.local_working_dir}")
 
     def __repr__(self):
         return "<BackupContext %r>" % self.local_working_dir
 
 
-pass_backup_context = click.make_pass_decorator(BackupContext)
+def get_context() -> BackupContext:
+    """Get the current backup context. Raises error if not initialized."""
+    if _backup_context is None:
+        typer.echo("Error: Context not initialized. This shouldn't happen.", err=True)
+        raise typer.Exit(1)
+    return _backup_context
 
 
-@click.group()
-@click.option(
-    "--bucket-name", prompt="Bucket name", help="The s3 bucket name to upload files to."
-)
-@click.option(
-    "--year",
-    prompt="Photo year",
-    default="{:02}".format(datetime.today().year),
-    help="The year dir to use in the working dir path (e.g. 2017).",
-)
-@click.option(
-    "--month",
-    prompt="Photo month",
-    default="{:02}".format(datetime.today().month),
-    help="The month dir to use in the working dir path (e.g. 09).",
-)
-@click.option(
-    "--device",
-    prompt="Device name",
-    default="default",
-    help="The device name to use in the working dir path (e.g. 'iPhone15').",
-)
-@click.pass_context
-def cli(ctx, bucket_name, year, month, device):
-    """
+# Create the Typer app
+app = typer.Typer(
+    help="""
     This utility copies image/video files from ~/Dropbox/Camera Uploads/
     into a local working dir, then uploads the files to an s3 bucket.
 
-    Example usage:\n
-      drop2s3 workflow\n
-      drop2s3 diffbucket\n
+    Example usage:
+      drop2s3 workflow
+      drop2s3 diffbucket
       drop2s3 rm-dropbox-files
     """
-    # Create a BackupContext object and remember it as as the context object.
-    # From this point onwards other commands can refer to it by using the
-    # @pass_backup_context decorator.
-    ctx.obj = BackupContext(bucket_name, year, month, device)
+)
 
 
-@cli.command()
-@pass_backup_context
-def mkdir(backup_context):
-    """Creates local working dir to copy Dropbox files to.
+@app.callback()
+def main(
+    bucket_name: str = typer.Option(
+        ..., prompt="Bucket name", help="The s3 bucket name to upload files to."
+    ),
+    year: str = typer.Option(
+        "{:02}".format(datetime.today().year),
+        prompt="Photo year",
+        help="The year dir to use in the working dir path (e.g. 2017).",
+    ),
+    month: str = typer.Option(
+        "{:02d}".format(datetime.today().month),
+        prompt="Photo month",
+        help="The month dir to use in the working dir path (e.g. 09).",
+    ),
+    device: str = typer.Option(
+        "default",
+        prompt="Device name",
+        help="The device name to use in the working dir path (e.g. 'iPhone15').",
+    ),
+):
+    """
+    Initialize the backup context with bucket, year, month, and device information.
+    """
+    global _backup_context
+    _backup_context = BackupContext(bucket_name, year, month, device)
+
+
+@app.command()
+def mkdir():
+    """
+    Creates local working dir to copy Dropbox files to.
     will be copied from your Dropbox/Camera Uploads/ dir.
     The working dir files can then be uploaded to an s3 bucket.
     """
-    backup_context.mkdir()
+    ctx = get_context()
+    ctx.mkdir()
 
 
-@cli.command()
-@pass_backup_context
-@click.option(
-    "--dryrun",
-    prompt="Dry run?",
-    type=click.BOOL,
-    default=True,
-    help="Do not actually copy files.",
-)
-def cp(backup_context, dryrun):
-    """Copy files from Dropbox to working dir.
+@app.command()
+def cp(
+    dryrun: bool = typer.Option(
+        True, prompt="Dry run?", help="Do not actually copy files."
+    )
+):
+    """
+    Copy files from Dropbox to working dir.
 
     Note that files with video extensions will be copied into
     a "video" subdir of the working dir.
     """
+    ctx = get_context()
     # Check for working dir and run mkdir() if it doesn't exist
-    backup_context.mkdir()
-    click.echo(f"About to copy files from: {backup_context.dropbox_camera_uploads_dir}")
-    click.echo(f"To local working dir: {backup_context.local_working_dir}")
+    ctx.mkdir()
+    typer.echo(f"About to copy files from: {ctx.dropbox_camera_uploads_dir}")
+    typer.echo(f"To local working dir: {ctx.local_working_dir}")
 
-    for dropbox_file_name in backup_context.dropbox_filenames:
-        file_row = backup_context.get_file_db_row(dropbox_file_name)
+    for dropbox_file_name in ctx.dropbox_filenames:
+        file_row = ctx.get_file_db_row(dropbox_file_name)
         if file_row["InWorkingDir"]:
-            click.echo(f"Skipping file '{dropbox_file_name}'; it already exists in workdir")
+            typer.echo(f"Skipping file '{dropbox_file_name}'; it already exists in workdir")
             continue
 
         # Get destination path using helper method
-        dest_path = backup_context.get_file_destination_path(
-            dropbox_file_name, backup_context.local_working_dir
-        )
+        dest_path = ctx.get_file_destination_path(dropbox_file_name, ctx.local_working_dir)
 
         if dryrun:
-            click.echo(f"Dry run; would have copied '{dropbox_file_name}' to workdir")
+            typer.echo(f"Dry run; would have copied '{dropbox_file_name}' to workdir")
         else:
-            click.echo(f"Copying '{dropbox_file_name}' to {dest_path.parent}")
-            copy2(backup_context.dropbox_camera_uploads_dir / dropbox_file_name, dest_path)
+            typer.echo(f"Copying '{dropbox_file_name}' to {dest_path.parent}")
+            copy2(ctx.dropbox_camera_uploads_dir / dropbox_file_name, dest_path)
 
 
-@cli.command()
-@pass_backup_context
-@click.option(
-    "--dryrun",
-    prompt="Dry run?",
-    type=click.BOOL,
-    default=True,
-    help="Do not actually delete files.",
-)
-def rm_dropbox_files(backup_context, dryrun):
+@app.command()
+def rm_dropbox_files(
+    dryrun: bool = typer.Option(
+        True, prompt="Dry run?", help="Do not actually delete files."
+    )
+):
     """Delete backed-up files in your Camera Uploads dir."""
+    ctx = get_context()
     # Verify files exist in both working dir and S3 before deletion
-    click.echo("Checking for Dropbox files in workdir and s3...")
-    for dropbox_file_name in backup_context.dropbox_filenames:
-        file_row = backup_context.get_file_db_row(dropbox_file_name)
+    typer.echo("Checking for Dropbox files in workdir and s3...")
+    for dropbox_file_name in ctx.dropbox_filenames:
+        file_row = ctx.get_file_db_row(dropbox_file_name)
         in_workdir = file_row["InWorkingDir"]
         in_s3 = file_row["InS3"]
 
-        dropbox_file_path = backup_context.dropbox_camera_uploads_dir / dropbox_file_name
-        workdir_file_path = backup_context.get_file_destination_path(
-            dropbox_file_name, backup_context.local_working_dir
+        dropbox_file_path = ctx.dropbox_camera_uploads_dir / dropbox_file_name
+        workdir_file_path = ctx.get_file_destination_path(
+            dropbox_file_name, ctx.local_working_dir
         )
 
         if in_workdir and in_s3:
             # Verify file integrity before deletion
             if filecmp.cmp(dropbox_file_path, workdir_file_path, shallow=False):
                 if dryrun:
-                    click.echo(f"[dry run] would have deleted Dropbox file '{dropbox_file_name}'")
+                    typer.echo(f"[dry run] would have deleted Dropbox file '{dropbox_file_name}'")
                 else:
-                    click.echo(f"Deleting {dropbox_file_path}...")
+                    typer.echo(f"Deleting {dropbox_file_path}...")
                     os.remove(dropbox_file_path)
             else:
-                click.echo(
+                typer.echo(
                     f"Error: Files differ! Dropbox: '{dropbox_file_name}', "
                     f"Workdir: '{workdir_file_path}'"
                 )
-                click.echo("Aborting clean; please investigate before continuing.")
-                sys.exit(1)
+                typer.echo("Aborting clean; please investigate before continuing.")
+                raise typer.Exit(1)
         else:
-            click.echo(
+            typer.echo(
                 f"Skipping rm of Dropbox file '{dropbox_file_name}'; "
                 "it's not present in both workdir and s3..."
             )
-            click.echo("Please run the upload command to back the file up in s3 first.")
+            typer.echo("Please run the upload command to back the file up in s3 first.")
 
 
-@cli.command()
-@pass_backup_context
-def difflocal(backup_context):
+@app.command()
+def difflocal():
     """Diff Dropbox and working dir contents."""
+    ctx = get_context()
     fmt = "{:<40}{:<20}"
     print(fmt.format("File name", "Status"))
     query = "SELECT * FROM files ORDER BY Filename"
-    for row in backup_context.db_manager.execute_query(query):
+    for row in ctx.db_manager.execute_query(query):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
         in_s3 = row["InS3"]
 
-        dropbox_file_path = backup_context.dropbox_camera_uploads_dir / filename
-        workdir_file_path = backup_context.get_file_destination_path(
-            filename, backup_context.local_working_dir
-        )
+        dropbox_file_path = ctx.dropbox_camera_uploads_dir / filename
+        workdir_file_path = ctx.get_file_destination_path(filename, ctx.local_working_dir)
 
         if in_dropbox == 1 and in_workdir == 1:
             if filecmp.cmp(dropbox_file_path, workdir_file_path, shallow=False):
@@ -385,19 +388,19 @@ def difflocal(backup_context):
             else:
                 print(fmt.format(filename, "diff NOT OK - files differ!"))
         elif in_dropbox == 1 and in_workdir == 0:
-            click.secho(fmt.format(filename, "dropbox only"), bg="red", fg="white")
+            typer.secho(fmt.format(filename, "dropbox only"), bg=typer.colors.RED, fg=typer.colors.WHITE)
         elif in_dropbox == 0 and in_workdir == 0 and in_s3 == 1:
-            click.secho(fmt.format(filename, "s3 only"), bg="blue", fg="white")
+            typer.secho(fmt.format(filename, "s3 only"), bg=typer.colors.BLUE, fg=typer.colors.WHITE)
 
 
-@cli.command()
-@pass_backup_context
-def diffbucket(backup_context):
+@app.command()
+def diffbucket():
     """Diff working dir and s3 bucket contents."""
+    ctx = get_context()
     fmt = "{:<40}{:<20}"
     print(fmt.format("File name", "Status"))
     query = "SELECT * FROM files ORDER BY Filename"
-    for row in backup_context.db_manager.execute_query(query):
+    for row in ctx.db_manager.execute_query(query):
         filename = row["Filename"]
         in_dropbox = row["InDropbox"]
         in_workdir = row["InWorkingDir"]
@@ -406,142 +409,195 @@ def diffbucket(backup_context):
         if in_workdir == 1 and in_s3 == 1:
             print(fmt.format(filename, "found in s3 & workdir"))
         elif in_workdir == 1 and in_s3 == 0:
-            click.secho(fmt.format(filename, "workdir only"), bg="red", fg="white")
+            typer.secho(fmt.format(filename, "workdir only"), bg=typer.colors.RED, fg=typer.colors.WHITE)
         elif in_workdir == 0 and in_s3 == 1:
-            click.secho(fmt.format(filename, "s3 only"))
+            typer.secho(fmt.format(filename, "s3 only"))
         elif in_workdir == 0 and in_s3 == 0 and in_dropbox == 1:
-            click.secho(fmt.format(filename, "dropbox only"), bg="red", fg="white")
+            typer.secho(fmt.format(filename, "dropbox only"), bg=typer.colors.RED, fg=typer.colors.WHITE)
 
 
-@cli.command()
-@pass_backup_context
-@click.option(
-    "--dryrun",
-    prompt="Dry run?",
-    type=click.BOOL,
-    default=True,
-    help="Do not actually upload files.",
-)
-def upload(backup_context, dryrun):
+@app.command()
+def upload(
+    dryrun: bool = typer.Option(
+        True, prompt="Dry run?", help="Do not actually upload files."
+    )
+):
     """Uploads local working dir files to an s3 bucket."""
-    for workdir_filename in backup_context.working_dir_filenames:
-        file_row = backup_context.get_file_db_row(workdir_filename)
+    ctx = get_context()
+    for workdir_filename in ctx.working_dir_filenames:
+        file_row = ctx.get_file_db_row(workdir_filename)
         if file_row["InS3"]:
             continue  # File already exists in S3
 
         # Determine S3 key path based on file type
         file_ext = os.path.splitext(workdir_filename)[1]
-        if file_ext in backup_context.video_file_extensions:
-            bucket_key = backup_context.dir_prefix + "video/" + workdir_filename
+        if file_ext in ctx.video_file_extensions:
+            bucket_key = ctx.dir_prefix + "video/" + workdir_filename
         else:
-            bucket_key = backup_context.dir_prefix + workdir_filename
+            bucket_key = ctx.dir_prefix + workdir_filename
 
-        workdir_file_path = backup_context.get_file_destination_path(
-            workdir_filename, backup_context.local_working_dir
-        )
+        workdir_file_path = ctx.get_file_destination_path(workdir_filename, ctx.local_working_dir)
 
         if dryrun:
-            click.echo(f"Dry run; would have uploaded '{workdir_filename}' to s3 key '{bucket_key}'")
+            typer.echo(f"Dry run; would have uploaded '{workdir_filename}' to s3 key '{bucket_key}'")
         else:
-            click.echo(f"Uploading '{workdir_file_path}' to s3 key '{bucket_key}'")
-            backup_context.bucket.upload_file(str(workdir_file_path), bucket_key)
+            typer.echo(f"Uploading '{workdir_file_path}' to s3 key '{bucket_key}'")
+            ctx.bucket.upload_file(str(workdir_file_path), bucket_key)
 
 
-@cli.command()
-@pass_backup_context
-@click.option(
-    "--dryrun",
-    prompt="Dry run?",
-    type=click.BOOL,
-    default=True,
-    help="Do not actually download files.",
-)
-def download(backup_context, dryrun):
+@app.command()
+def download(
+    dryrun: bool = typer.Option(
+        True, prompt="Dry run?", help="Do not actually download files."
+    )
+):
     """Downloads files from s3 to local working dir."""
+    ctx = get_context()
     if not dryrun:
-        backup_context.mkdir()
+        ctx.mkdir()
 
-    for key in backup_context.bucket_file_paths:
-        dest_path = backup_context.local_bucket_dir / key
+    for key in ctx.bucket_file_paths:
+        dest_path = ctx.local_bucket_dir / key
 
         if dryrun:
-            click.echo(f"Dry run; would have downloaded s3 key '{key}' to '{dest_path}'")
+            typer.echo(f"Dry run; would have downloaded s3 key '{key}' to '{dest_path}'")
         else:
-            click.echo(f"Downloading s3 key '{key}' to '{dest_path}'")
+            typer.echo(f"Downloading s3 key '{key}' to '{dest_path}'")
             # Ensure parent directory exists
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            backup_context.bucket.download_file(key, str(dest_path))
+            ctx.bucket.download_file(key, str(dest_path))
 
 
-@cli.command()
-@pass_backup_context
-def lsbucket(backup_context):
-    """Print s3 bucket contents for given year/month/device.
-    """
-    for key in backup_context.bucket_file_paths:
+@app.command()
+def lsbucket():
+    """Print s3 bucket contents for given year/month/device."""
+    ctx = get_context()
+    for key in ctx.bucket_file_paths:
         print(key)
 
 
-@cli.command()
-@pass_backup_context
-def lsdb(backup_context):
-    """Populate and print DB rows for given year/month/device.
-    """
+@app.command()
+def lsdb():
+    """Populate and print DB rows for given year/month/device."""
+    ctx = get_context()
     pd.set_option("display.max_rows", 1000)
-    print(pd.read_sql_query("SELECT * FROM files", backup_context.db))
+    print(pd.read_sql_query("SELECT * FROM files", ctx.db))
 
 
-@cli.command()
-@pass_backup_context
-def lsdropbox(backup_context):
-    """Print Dropbox contents for given year/month/device.
-    """
-    for name in backup_context.dropbox_filenames:
+@app.command()
+def lsdropbox():
+    """Print Dropbox contents for given year/month/device."""
+    ctx = get_context()
+    for name in ctx.dropbox_filenames:
         print(name)
 
 
-@cli.command()
-@pass_backup_context
-def lsworkdir(backup_context):
-    """Print working dir contents for given year/month/device.
-    """
-    for filename in backup_context.working_dir_filenames:
+@app.command()
+def lsworkdir():
+    """Print working dir contents for given year/month/device."""
+    ctx = get_context()
+    for filename in ctx.working_dir_filenames:
         print(filename)
 
 
-@cli.command()
-@pass_backup_context
-def sync_workdir(backup_context):
-    """s3 sync working dir contents for given year/month/device.
-    """
+@app.command()
+def sync_workdir():
+    """s3 sync working dir contents for given year/month/device."""
+    ctx = get_context()
     # TODO - use snippet from
     # https://github.com/boto/boto3/issues/358#issuecomment-372086466
-    for filename in backup_context.working_dir_filenames:
+    for filename in ctx.working_dir_filenames:
         print(filename)
 
 
-@cli.command()
-@click.pass_context
-@click.option(
-    "--dryrun",
-    prompt="Dry run?",
-    type=click.BOOL,
-    default=True,
-    help="Print steps rather than execute them.",
-)
-def workflow(backup_context, dryrun):
+@app.command()
+def workflow(
+    dryrun: bool = typer.Option(
+        True, prompt="Dry run?", help="Print steps rather than execute them."
+    )
+):
     """Runs all commands for a typical backup workflow."""
-    backup_context.invoke(mkdir)
-    backup_context.invoke(difflocal)
+    ctx = get_context()
 
-    click.confirm("About to copy files to workdir - do you want to continue?", abort=True)
-    backup_context.forward(cp)
+    # Run mkdir
+    ctx.mkdir()
+
+    # Run difflocal
+    typer.echo("\n=== Running difflocal ===")
+    fmt = "{:<40}{:<20}"
+    print(fmt.format("File name", "Status"))
+    query = "SELECT * FROM files ORDER BY Filename"
+    for row in ctx.db_manager.execute_query(query):
+        filename = row["Filename"]
+        in_dropbox = row["InDropbox"]
+        in_workdir = row["InWorkingDir"]
+        in_s3 = row["InS3"]
+
+        dropbox_file_path = ctx.dropbox_camera_uploads_dir / filename
+        workdir_file_path = ctx.get_file_destination_path(filename, ctx.local_working_dir)
+
+        if in_dropbox == 1 and in_workdir == 1:
+            if filecmp.cmp(dropbox_file_path, workdir_file_path, shallow=False):
+                print(fmt.format(filename, "diff OK"))
+            else:
+                print(fmt.format(filename, "diff NOT OK - files differ!"))
+        elif in_dropbox == 1 and in_workdir == 0:
+            typer.secho(fmt.format(filename, "dropbox only"), bg=typer.colors.RED, fg=typer.colors.WHITE)
+        elif in_dropbox == 0 and in_workdir == 0 and in_s3 == 1:
+            typer.secho(fmt.format(filename, "s3 only"), bg=typer.colors.BLUE, fg=typer.colors.WHITE)
+
+    typer.confirm("About to copy files to workdir - do you want to continue?", abort=True)
+
+    # Copy files
+    typer.echo(f"\n=== Copying files (dryrun={dryrun}) ===")
+    typer.echo(f"About to copy files from: {ctx.dropbox_camera_uploads_dir}")
+    typer.echo(f"To local working dir: {ctx.local_working_dir}")
+
+    for dropbox_file_name in ctx.dropbox_filenames:
+        file_row = ctx.get_file_db_row(dropbox_file_name)
+        if file_row["InWorkingDir"]:
+            typer.echo(f"Skipping file '{dropbox_file_name}'; it already exists in workdir")
+            continue
+
+        dest_path = ctx.get_file_destination_path(dropbox_file_name, ctx.local_working_dir)
+
+        if dryrun:
+            typer.echo(f"Dry run; would have copied '{dropbox_file_name}' to workdir")
+        else:
+            typer.echo(f"Copying '{dropbox_file_name}' to {dest_path.parent}")
+            copy2(ctx.dropbox_camera_uploads_dir / dropbox_file_name, dest_path)
 
     if dryrun:
-        print("Skipping s3 preview step since dryrun mode is on...")
+        print("\nSkipping s3 preview step since dryrun mode is on...")
     else:
-        click.confirm("About to upload files to s3 - do you want to continue?", abort=True)
+        typer.confirm("About to upload files to s3 - do you want to continue?", abort=True)
         # Reinitialize DB with updated paths after copying files
-        backup_context.obj.init_db()
-        backup_context.forward(upload)
-        click.echo("All done - to delete your files from Dropbox, run the rm-dropbox-files command.")
+        ctx.init_db()
+
+        # Upload files
+        typer.echo("\n=== Uploading files to S3 ===")
+        for workdir_filename in ctx.working_dir_filenames:
+            file_row = ctx.get_file_db_row(workdir_filename)
+            if file_row["InS3"]:
+                continue
+
+            file_ext = os.path.splitext(workdir_filename)[1]
+            if file_ext in ctx.video_file_extensions:
+                bucket_key = ctx.dir_prefix + "video/" + workdir_filename
+            else:
+                bucket_key = ctx.dir_prefix + workdir_filename
+
+            workdir_file_path = ctx.get_file_destination_path(workdir_filename, ctx.local_working_dir)
+            typer.echo(f"Uploading '{workdir_file_path}' to s3 key '{bucket_key}'")
+            ctx.bucket.upload_file(str(workdir_file_path), bucket_key)
+
+        typer.echo("\nAll done - to delete your files from Dropbox, run the rm-dropbox-files command.")
+
+
+def cli():
+    """Entry point for the CLI."""
+    app()
+
+
+if __name__ == "__main__":
+    cli()
